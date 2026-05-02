@@ -6,38 +6,128 @@ import os
 from ultralytics import YOLO
 
 # ==========================================
-# 1. CONNECTIVITY CONFIG
+# 1. CONFIGURATION
 # ==========================================
-# UDP stream from Raspberry Pi camera
 UDP_STREAM_URL = "udp://0.0.0.0:5000?overrun_nonfatal=1&fifo_size=5000000"
-
-# Zero-latency environment flag for OpenCV
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
-
-# Setup UDP Bridge to Go Orchestrator
 BRIDGE_IP = "127.0.0.1"
 BRIDGE_PORT = 8080
-udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
 
 # ==========================================
-# 2. HAAR CASCADE & HOG CONFIG
+# 2. INITIALIZATION
 # ==========================================
-# Load the pre-trained Haar Cascade for frontal face detection built into OpenCV
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Initialize YOLO for person detection (Fallback)
 try:
     from ultralytics import YOLOE
     yolo_model = YOLOE("yoloe-26n-seg.pt")
 except ImportError:
     yolo_model = YOLO("yoloe-26n-seg.pt")
 
-# Restrict YOLO to finding persons
 try:
     yolo_model.set_classes(["person"], yolo_model.get_text_pe(["person"]))
 except AttributeError:
     pass
 
+udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# ==========================================
+# 3. DETECTION HELPERS
+# ==========================================
+def detect_haar_faces(gray):
+    """Detects faces using Haar Cascades and returns a list of target dicts."""
+    faces, rejectLevels, levelWeights = face_cascade.detectMultiScale3(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30), outputRejectLevels=True
+    )
+    targets = []
+    if len(faces) > 0:
+        for face, weight in zip(faces, levelWeights):
+            fx, fy, fw, fh = face
+            confidence = weight[0] if isinstance(weight, (list, np.ndarray)) else weight
+            targets.append({
+                'coords': (fx + fw / 2.0, fy + fh / 2.0),
+                'area': fw * fh,
+                'type': 'face',
+                'bbox': (fx, fy, fw, fh),
+                'confidence': confidence
+            })
+    return targets
+
+def detect_yolo_persons(frame):
+    """Detects persons using YOLO and returns a list of target dicts and raw results."""
+    results = yolo_model(frame, verbose=False, conf=0.55)
+    targets = []
+    if len(results[0].boxes) > 0:
+        for box in results[0].boxes:
+            b = box.xyxy[0].cpu().numpy()
+            px, py, px2, py2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            pw, ph = px2 - px, py2 - py
+            targets.append({
+                'coords': (px + pw / 2.0, py + ph * 0.3),  # Aiming for upper chest/head
+                'area': pw * ph,
+                'type': 'person',
+                'bbox': (px, py, pw, ph)
+            })
+    return targets, results
+
+def select_best_target(targets, cx, cy, last_coords):
+    """Ranks targets by area and center bias, prioritizing faces."""
+    if not targets:
+        return None
+        
+    max_dist = np.hypot(cx, cy)
+    for t in targets:
+        tx, ty = t['coords']
+        
+        # 1. Base Center Boost
+        dist = np.hypot(tx - cx, ty - cy)
+        center_boost = 1.0 + 0.3 * (1.0 - (dist / max_dist))
+        
+        # 2. Hysteresis "Lock-On" Boost
+        stickiness_boost = 1.0
+        if last_coords is not None:
+            # If this target is close to the previous winner, give it a massive score advantage
+            dist_from_last = np.hypot(tx - last_coords[0], ty - last_coords[1])
+            if dist_from_last < 100:
+                stickiness_boost = 1.5
+                
+        t['score'] = t['area'] * center_boost * stickiness_boost
+
+    targets.sort(key=lambda x: x['score'], reverse=True)
+    
+    faces = [t for t in targets if t['type'] == 'face']
+    persons = [t for t in targets if t['type'] == 'person']
+    
+    if faces and persons:
+        # Scale face score to fairly compare with larger person bounding boxes
+        if faces[0]['score'] * 15 > persons[0]['score']:
+            return faces[0]
+        return persons[0]
+    
+    return faces[0] if faces else persons[0]
+
+def draw_winner(frame, winner):
+    """Draws bounding boxes and labels for the selected target."""
+    color = (255, 0, 0) if winner['type'] == 'face' else (0, 255, 0)
+    label = f"FACE TARGET (Conf: {winner['confidence']:.2f})" if winner['type'] == 'face' else "PERSON TARGET"
+    
+    x, y, w, h = winner['bbox']
+    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+    cv2.putText(frame, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    
+    print(f"[{winner['type'].upper()}] Tracking at ({x}, {y})")
+    return frame
+
+def draw_crosshair(frame, cx, cy):
+    """Draws a magenta crosshair representing the current smoothed aim."""
+    cv2.circle(frame, (cx, cy), 15, (255, 0, 255), 2)
+    cv2.line(frame, (cx - 25, cy), (cx + 25, cy), (255, 0, 255), 2)
+    cv2.line(frame, (cx, cy - 25), (cx, cy + 25), (255, 0, 255), 2)
+
+# ==========================================
+# 4. MAIN LOOP
+# ==========================================
 def main():
     print(f"Connecting to video stream at {UDP_STREAM_URL}...")
     cap = cv2.VideoCapture(UDP_STREAM_URL, cv2.CAP_FFMPEG)
@@ -46,19 +136,16 @@ def main():
         print("Error: Could not open video stream.")
         return
         
-    window_name = "Haar Cascade Tracking"
+    window_name = "Target Tracking"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     
-    # Init Tracking Variables
     target_aim = None
     current_aim = None
-    
-    print("Haar Cascade Brain Online. Hunting for faces...")
+    last_winner_coords = None
+    print("Tracking System Online. Hunting for targets...")
     
     while True:
-        # Flush the buffer to ensure we only see the absolute newest frame
-        for _ in range(5):
-            cap.grab() 
+        for _ in range(5): cap.grab()  # Flush buffer
             
         ret, frame = cap.read()
         if not ret:
@@ -66,107 +153,54 @@ def main():
             
         height, width = frame.shape[:2]
         cx, cy = width // 2, height // 2
-        
-        # Convert frame to grayscale for Haar Cascade
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Detect faces and get confidences using detectMultiScale3
-        # scaleFactor=1.1, minNeighbors=5 are standard reliable parameters
-        faces, rejectLevels, levelWeights = face_cascade.detectMultiScale3(
-            gray, 
-            scaleFactor=1.1, 
-            minNeighbors=5, 
-            minSize=(30, 30),
-            outputRejectLevels=True
-        )
-        
-        face_detected_this_frame = False
-        
-        if len(faces) > 0:
-            face_detected_this_frame = True
-            
-            # Find the largest face by area, pairing it with its confidence weight
-            face_data = list(zip(faces, levelWeights))
-            largest_face_tuple = max(face_data, key=lambda data: data[0][2] * data[0][3])
-            
-            largest_face = largest_face_tuple[0]
-            # Handle format of levelWeights depending on OpenCV version
-            confidence = largest_face_tuple[1][0] if isinstance(largest_face_tuple[1], (list, np.ndarray)) else largest_face_tuple[1]
-            
-            fx, fy, fw, fh = largest_face
-            
-            print(f"[HAAR] Face Detected at ({fx}, {fy}) | Confidence (Weight): {confidence:.2f}")
-            
-            # Draw bounding box around the detected face
-            cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (255, 0, 0), 2)
-            cv2.putText(frame, f"FACE (Conf: {confidence:.2f})", (fx, max(20, fy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-            
-            # Calculate center of the face
-            target_x = fx + (fw / 2.0)
-            target_y = fy + (fh / 2.0)
-            target_aim = [target_x, target_y]
-        else:
-            # Fallback to Person Detection if no face is found
-            # Run YOLO on the full frame
-            results = yolo_model(frame, verbose=False, conf=0.55)
-            
-            if len(results[0].boxes) > 0:
-                face_detected_this_frame = True # Re-use flag so it doesn't drift back to center
-                
-                # We can just pick the first person detected
-                box = results[0].boxes[0].xyxy[0].cpu().numpy() # [x1, y1, x2, y2]
-                px, py, px2, py2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                pw = px2 - px
-                ph = py2 - py
-                
-                # Draw the YOLO results on the frame
-                annotated_frame = results[0].plot()
-                # Overwrite frame with annotated version
-                frame = annotated_frame
-                
-                cv2.putText(frame, "PERSON DETECTED (YOLO)", (px, max(20, py - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                target_x = px + (pw / 2.0)
-                # For a person, aim for the upper chest/head area rather than the stomach (center)
-                target_y = py + (ph * 0.3)
-                target_aim = [target_x, target_y]
+        # 1. Gather all potential targets
+        potential_targets = detect_haar_faces(gray)
+        yolo_targets, yolo_results = detect_yolo_persons(frame)
+        potential_targets.extend(yolo_targets)
 
-        # --- The Proportional Controller & Robotic Crosshair ---
-        if target_aim is None or current_aim is None:
-            # Default to resting at the center of the frame
+        # 2. Select the optimal target
+        winner = select_best_target(potential_targets, cx, cy, last_winner_coords)
+        
+        # 3. Handle aiming logic
+        if winner:
+            last_winner_coords = winner['coords']
+            target_aim = [winner['coords'][0], winner['coords'][1]]
+            frame = draw_winner(frame, winner)
+        elif target_aim is None or current_aim is None:
+            last_winner_coords = None
             target_aim = [float(cx), float(cy)]
             current_aim = [float(cx), float(cy)]
-            
-        if not face_detected_this_frame:
-            # Drift back to center when no face is found
+        else:
+            last_winner_coords = None
+            # Drift back to center if no target is found
             target_aim = [float(cx), float(cy)]
             
-        # P-Controller Smoothing Math
-        # Increased from 0.1 to 0.4 for much tighter and faster tracking
+        if current_aim is None:
+            current_aim = target_aim.copy()
+
+        # 4. P-Controller Smoothing Math
         current_aim[0] += (target_aim[0] - current_aim[0]) * 0.4
         current_aim[1] += (target_aim[1] - current_aim[1]) * 0.4
 
-        # SEND TO BRIDGE
-        # Send the current smoothed crosshair coordinates to the bridge
+        # 5. Send telemetry to the Go Bridge
         payload = {
             "target_x": float(current_aim[0]),
             "target_y": float(current_aim[1]),
             "cx": float(cx),
             "cy": float(cy),
-            "confidence": 1.0 if face_detected_this_frame else 0.0
+            "confidence": 1.0 if winner else 0.0
         }
         try:
             udp_socket.sendto(json.dumps(payload).encode('utf-8'), (BRIDGE_IP, BRIDGE_PORT))
-        except Exception as e:
+        except Exception:
             pass
         
-        # Draw the Robotic Crosshair (Magenta)
-        c_x, c_y = int(current_aim[0]), int(current_aim[1])
-        cv2.circle(frame, (c_x, c_y), 15, (255, 0, 255), 2)
-        cv2.line(frame, (c_x - 25, c_y), (c_x + 25, c_y), (255, 0, 255), 2)
-        cv2.line(frame, (c_x, c_y - 25), (c_x, c_y + 25), (255, 0, 255), 2)
-
+        # 6. Render UI
+        draw_crosshair(frame, int(current_aim[0]), int(current_aim[1]))
         cv2.imshow(window_name, frame)
+        
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
             
