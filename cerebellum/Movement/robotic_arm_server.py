@@ -87,6 +87,59 @@ def rest_pose():
     move_servo(servos[4], 90, from_angle=current_angles[4])
     print("In rest pose.")
 
+def calibration_dance():
+    """Executes pre-programmed movements to help the BNO055 find its bearings."""
+    print("Starting Calibration Dance...")
+    # 1. Stillness (Gyro)
+    time.sleep(2) 
+    # 2. Tilt patterns (Accel)
+    move_servo(servos[0], 45)  # Tilt up
+    time.sleep(1)
+    move_servo(servos[0], 135) # Tilt down
+    time.sleep(1)
+    move_servo(servos[0], 90)  # Center
+    # 3. Pan patterns (Mag)
+    move_servo(servos[4], 0)
+    time.sleep(1)
+    move_servo(servos[4], 180)
+    time.sleep(1)
+    move_servo(servos[4], 90)
+    print("Calibration Dance complete.")
+
+def process_command(message):
+    """Parses and executes a command message, returning a response string."""
+    try:
+        parts = message.split()
+        if not parts:
+            return "Error: Empty command."
+            
+        if len(parts) == 4 and parts[0] == 'servo' and parts[2] == 'angle':
+            servo_id = int(parts[1])
+            angle = int(parts[3])
+            
+            if servo_id not in servos:
+                return f"Error: Invalid servo ID '{servo_id}'."
+            if not (0 <= angle <= 180):
+                return f"Error: Invalid angle '{angle}'. Must be 0-180."
+                
+            servo_obj = servos[servo_id]
+            move_servo(servo_obj, angle)
+            return f"OK: Moving servo {servo_id} to {angle}."
+        
+        elif len(parts) == 1 and parts[0] == 'rest':
+            rest_pose()
+            return "OK: Moved to rest pose."
+        
+        elif len(parts) == 1 and parts[0] == 'calibrate':
+            calibration_dance()
+            return "OK: Calibration Dance complete."
+
+        else:
+            return "Error: Invalid command format. Use 'servo X angle Y', 'rest', or 'calibrate'."
+
+    except (ValueError, IndexError):
+        return "Error: Invalid command. Could not parse."
+
 # --- Main Server Function ---
 
 def run_server():
@@ -119,49 +172,13 @@ def run_server():
             message = command_socket.recv_string()
             print(f"Received command: '{message}'")
             
-            response = "Acknowledged. No action taken."
-            execute_move = False
+            # 2. Parse and execute the command
+            response = process_command(message)
             
-            # 2. Parse the command
-            try:
-                parts = message.split()
-                if len(parts) == 4 and parts[0] == 'servo' and parts[2] == 'angle':
-                    servo_id = int(parts[1])
-                    angle = int(parts[3])
-                    
-                    # 3. Validate the command
-                    if servo_id not in servos:
-                        response = f"Error: Invalid servo ID '{servo_id}'."
-                    elif not (0 <= angle <= 180):
-                        response = f"Error: Invalid angle '{angle}'. Must be 0-180."
-                    else:
-                        # Command is valid
-                        response = f"OK: Moving servo {servo_id} to {angle}."
-                        execute_move = True
-                
-                elif len(parts) == 1 and parts[0] == 'rest':
-                    rest_pose()
-                    response = "OK: Moved to rest pose."
-                    execute_move = False
-                
-                else:
-                    response = "Error: Invalid command format. Use 'servo X angle Y' or 'rest'."
-
-            except (ValueError, IndexError):
-                response = "Error: Invalid command. Could not parse."
-            
-            # 4. Execute the command (if valid)
-            if execute_move:
-                servo_obj = servos[servo_id]
-                
-                # This function now contains the error handling
-                move_servo(servo_obj, angle)
-                # Update the state tracker
-                current_angles[servo_id] = angle
-            # 5. Send the reply
+            # 3. Send the reply
             command_socket.send_string(response)
             
-            # 6. Publish the new state (always, even on error)
+            # 4. Publish the new state (always, even on error)
             state_message = json.dumps(current_angles)
             publish_socket.send_string(f"{PUB_TOPIC} {state_message}")
             print(f"Published state: {state_message}")
