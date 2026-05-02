@@ -117,12 +117,12 @@ func main() {
 	earURL := fmt.Sprintf("tcp://%s:5557", *piIP)
 	err = earSub.Dial(earURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to Inner Ear SUB at %s: %v", earURL, err)
-	}
-
-	err = earSub.SetOption(zmq4.OptionSubscribe, "orientation")
-	if err != nil {
-		log.Fatalf("Failed to subscribe to orientation: %v", err)
+		log.Printf("Warning: Failed to connect to Inner Ear SUB at %s: %v. Inner Ear will be ignored.", earURL, err)
+	} else {
+		err = earSub.SetOption(zmq4.OptionSubscribe, "orientation")
+		if err != nil {
+			log.Printf("Warning: Failed to subscribe to orientation: %v", err)
+		}
 	}
 
 	var stateMutex sync.Mutex
@@ -130,6 +130,7 @@ func main() {
 	tiltAngle := 90.0
 	currentOrientation := Orientation{} // NEW: Store inner ear data
 	stateInitialized := false
+	innerEarActive := false // Track if Inner Ear is sending data
 
 	// Goroutine to sync state from the Pi
 	go func() {
@@ -182,6 +183,7 @@ func main() {
 						// Thread-safe update of orientation
 						stateMutex.Lock()
 						currentOrientation = payload.Orientation
+						innerEarActive = true
 
 						// LOG THE CALIBRATION STATUS
 						// 0 = Uncalibrated, 3 = Fully Calibrated
@@ -302,6 +304,7 @@ func main() {
 		normOrientation := getNormalizedOrientation(currentOrientation)
 		sensorPitch := normOrientation.P // Get physical tilt
 		sensorRoll := normOrientation.R  // Get physical roll
+		isEarActive := innerEarActive
 		stateMutex.Unlock()
 
 		_ = sensorPitch
@@ -322,14 +325,16 @@ func main() {
 		}
 
 		// Apply the Deadzone Logic (Stabilization)
-		if math.Abs(sensorPitch) > *imuDeadzone {
-			// Only if we've tilted more than deadzone degrees do we calculate a correction
-			stabilizationStep := sensorPitch * 0.8 // Adjust gain as needed
-			newTilt -= stabilizationStep
-			movedTilt = true
-			log.Printf("[DEBUG] TILT STAB: pitch=%.1f, step=%.2f", sensorPitch, stabilizationStep)
-		} else {
-			// We are within the "Safe Zone" - keep current tilt to prevent buzzing
+		if isEarActive {
+			if math.Abs(sensorPitch) > *imuDeadzone {
+				// Only if we've tilted more than deadzone degrees do we calculate a correction
+				stabilizationStep := sensorPitch * 0.8 // Adjust gain as needed
+				newTilt -= stabilizationStep
+				movedTilt = true
+				log.Printf("[DEBUG] TILT STAB: pitch=%.1f, step=%.2f", sensorPitch, stabilizationStep)
+			} else {
+				// We are within the "Safe Zone" - keep current tilt to prevent buzzing
+			}
 		}
 
 		// Adjust Tilt (Vision Tracking)
