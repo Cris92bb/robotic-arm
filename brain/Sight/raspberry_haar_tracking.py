@@ -100,8 +100,13 @@ def select_best_target(targets, cx, cy, last_coords, current_locked_id):
 
     targets.sort(key=lambda x: x['score'], reverse=True)
     
-    faces = [t for t in targets if t['type'] == 'face']
-    persons = [t for t in targets if t['type'] == 'person']
+    faces = []
+    persons = []
+    for t in targets:
+        if t['type'] == 'face':
+            faces.append(t)
+        elif t['type'] == 'person':
+            persons.append(t)
     
     if faces and persons:
         # Scale face score to fairly compare with larger person bounding boxes
