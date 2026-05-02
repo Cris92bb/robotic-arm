@@ -126,6 +126,19 @@ func main() {
 		}
 	}
 
+	// --- NEW: Setup ZMQ PUB socket for the Frontal Lobe (Brain) ---
+	brainPub := zmq4.NewPub(context.Background())
+	defer brainPub.Close()
+
+	// Since brain.py and main.go run on the same laptop, we dial localhost
+	brainURL := "tcp://127.0.0.1:5563"
+	err = brainPub.Dial(brainURL)
+	if err != nil {
+		log.Printf("Warning: Failed to connect to Frontal Lobe at %s: %v", brainURL, err)
+	} else {
+		log.Printf("[VISUAL CORTEX] Connected to Frontal Lobe on port 5563")
+	}
+
 	var stateMutex sync.Mutex
 	panAngle := 90.0
 	tiltAngle := 90.0
@@ -286,13 +299,28 @@ func main() {
 
 		// --- NEW: Target Switch Detection ---
 		if payload.TargetID != lastTargetID {
+			var thought string // Keep track of what we want the LLM to think about
+			
 			switch payload.TargetID {
 			case 0:
 				log.Printf("[TARGET] Lost target. Returning to center.")
+				// Optional: thought = "I have lost visual contact with the target."
 			case -1:
 				log.Printf("[TARGET] Locked onto FACE.")
+				thought = "I have locked my camera onto a human face."
 			default:
 				log.Printf("[TARGET] Locked onto Person ID: %d", payload.TargetID)
+				thought = fmt.Sprintf("I have locked my camera onto person number %d.", payload.TargetID)
+			}
+
+			// Send the thought to the Brain instantly over ZMQ
+			if thought != "" {
+				err = brainPub.Send(zmq4.NewMsgString(thought))
+				if err != nil {
+					log.Printf("[ZMQ ERROR] Failed to send thought to brain: %v", err)
+				} else {
+					log.Printf("[VISUAL CORTEX -> BRAIN]: Triggered thought.")
+				}
 			}
 
 			lastTargetID = payload.TargetID
