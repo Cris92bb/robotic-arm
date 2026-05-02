@@ -55,23 +55,25 @@ def detect_haar_faces(gray):
     return targets
 
 def detect_yolo_persons(frame):
-    """Detects persons using YOLO and returns a list of target dicts and raw results."""
-    results = yolo_model(frame, verbose=False, conf=0.55)
+    """Detects and TRACKS persons using YOLO's built-in ByteTrack."""
+    results = yolo_model.track(frame, persist=True, verbose=False, conf=0.55, tracker="bytetrack.yaml")
     targets = []
-    if len(results[0].boxes) > 0:
-        for box in results[0].boxes:
-            b = box.xyxy[0].cpu().numpy()
-            px, py, px2, py2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+    if len(results[0].boxes) > 0 and results[0].boxes.id is not None:
+        track_ids = results[0].boxes.id.int().cpu().tolist()
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        for box, track_id in zip(boxes, track_ids):
+            px, py, px2, py2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             pw, ph = px2 - px, py2 - py
             targets.append({
                 'coords': (px + pw / 2.0, py + ph * 0.3),  # Aiming for upper chest/head
                 'area': pw * ph,
                 'type': 'person',
-                'bbox': (px, py, pw, ph)
+                'bbox': (px, py, pw, ph),
+                'track_id': track_id
             })
     return targets, results
 
-def select_best_target(targets, cx, cy, last_coords):
+def select_best_target(targets, cx, cy, last_coords, current_locked_id):
     """Ranks targets by area and center bias, prioritizing faces."""
     if not targets:
         return None
@@ -86,8 +88,10 @@ def select_best_target(targets, cx, cy, last_coords):
         
         # 2. Hysteresis "Lock-On" Boost
         stickiness_boost = 1.0
-        if last_coords is not None:
-            # If this target is close to the previous winner, give it a massive score advantage
+        if current_locked_id is not None and t['type'] == 'person' and t.get('track_id') == current_locked_id:
+            stickiness_boost = 3.0  # Massive 300% boost to never let go of this ID
+        elif last_coords is not None:
+            # Fallback to coordinate-based distance for faces or untracked persons
             dist_from_last = np.hypot(tx - last_coords[0], ty - last_coords[1])
             if dist_from_last < 100:
                 stickiness_boost = 1.5
@@ -142,6 +146,7 @@ def main():
     target_aim = None
     current_aim = None
     last_winner_coords = None
+    current_locked_id = None
     print("Tracking System Online. Hunting for targets...")
     
     while True:
@@ -161,19 +166,26 @@ def main():
         potential_targets.extend(yolo_targets)
 
         # 2. Select the optimal target
-        winner = select_best_target(potential_targets, cx, cy, last_winner_coords)
+        winner = select_best_target(potential_targets, cx, cy, last_winner_coords, current_locked_id)
         
         # 3. Handle aiming logic
         if winner:
             last_winner_coords = winner['coords']
+            if winner['type'] == 'person':
+                current_locked_id = winner['track_id']
+            # If it's a face, we deliberately DO NOT clear current_locked_id. 
+            # This keeps the person's body "warm" in memory just in case the face disappears.
+                
             target_aim = [winner['coords'][0], winner['coords'][1]]
             frame = draw_winner(frame, winner)
         elif target_aim is None or current_aim is None:
             last_winner_coords = None
+            current_locked_id = None
             target_aim = [float(cx), float(cy)]
             current_aim = [float(cx), float(cy)]
         else:
             last_winner_coords = None
+            current_locked_id = None
             # Drift back to center if no target is found
             target_aim = [float(cx), float(cy)]
             
