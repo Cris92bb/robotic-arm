@@ -196,13 +196,22 @@ def main():
         current_aim[0] += (target_aim[0] - current_aim[0]) * 0.4
         current_aim[1] += (target_aim[1] - current_aim[1]) * 0.4
 
+        # Determine the ID to send
+        target_id = 0
+        if winner:
+            if winner['type'] == 'person':
+                target_id = winner['track_id']
+            else:
+                target_id = -1  # Special ID denoting a Face
+
         # 5. Send telemetry to the Go Bridge
         payload = {
             "target_x": float(current_aim[0]),
             "target_y": float(current_aim[1]),
             "cx": float(cx),
             "cy": float(cy),
-            "confidence": 1.0 if winner else 0.0
+            "confidence": 1.0 if winner else 0.0,
+            "target_id": int(target_id)
         }
         try:
             udp_socket.sendto(json.dumps(payload).encode('utf-8'), (BRIDGE_IP, BRIDGE_PORT))

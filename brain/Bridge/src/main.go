@@ -23,6 +23,7 @@ type Payload struct {
 	CX         float64 `json:"cx"`
 	CY         float64 `json:"cy"`
 	Confidence float64 `json:"confidence"`
+	TargetID   int     `json:"target_id"` // <--- NEW DATA POINT
 }
 
 type Orientation struct {
@@ -264,6 +265,8 @@ func main() {
 	var lastMoveTime time.Time
 	cooldownDur := time.Duration(*cooldownMs) * time.Millisecond
 
+	var lastTargetID int = 0
+
 	buf := make([]byte, 2048)
 	log.Printf("Bridge is fully initialized and waiting for UDP coordinates...")
 
@@ -280,6 +283,21 @@ func main() {
 			log.Printf("Failed to parse JSON: %v", err)
 			continue
 		}
+
+		// --- NEW: Target Switch Detection ---
+		if payload.TargetID != lastTargetID {
+			switch payload.TargetID {
+			case 0:
+				log.Printf("[TARGET] Lost target. Returning to center.")
+			case -1:
+				log.Printf("[TARGET] Locked onto FACE.")
+			default:
+				log.Printf("[TARGET] Locked onto Person ID: %d", payload.TargetID)
+			}
+
+			lastTargetID = payload.TargetID
+		}
+		// ------------------------------------
 
 		overrideMutex.RLock()
 		override := isOverriding
