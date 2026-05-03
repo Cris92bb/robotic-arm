@@ -13,9 +13,39 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"net/http"
 
 	"github.com/go-zeromq/zmq4"
 )
+
+var (
+	telemetryClients      = make(map[chan string]bool)
+	telemetryClientsMutex sync.Mutex
+)
+
+func broadcastTelemetry(data string) {
+	telemetryClientsMutex.Lock()
+	defer telemetryClientsMutex.Unlock()
+	for clientChan := range telemetryClients {
+		// Non-blocking send
+		select {
+		case clientChan <- data:
+		default:
+		}
+	}
+}
+
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		next(w, r)
+	}
+}
 
 type Payload struct {
 	TargetX    float64 `json:"target_x"`
@@ -140,6 +170,128 @@ func main() {
 	}
 
 	var stateMutex sync.Mutex
+	var reqMutex sync.Mutex
+	var overrideMutex sync.RWMutex
+	isOverriding := false
+
+	// HTTP Server for Dashboard
+	http.HandleFunc("/command", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var reqBody struct {
+			Command string `json:"command"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		cmd := reqBody.Command
+		log.Printf("[DASHBOARD] Received manual command: %s", cmd)
+
+		if cmd == "calibrate" || cmd == "rest" {
+			overrideMutex.Lock()
+			isOverriding = true
+			overrideMutex.Unlock()
+
+			reqMutex.Lock()
+			req.Send(zmq4.NewMsgString(cmd))
+			req.Recv()
+
+			if cmd == "calibrate" {
+				req.Send(zmq4.NewMsgString("rest"))
+				req.Recv()
+			}
+			reqMutex.Unlock()
+
+			overrideMutex.Lock()
+			isOverriding = false
+			overrideMutex.Unlock()
+		} else {
+			// e.g. "servo 0 angle 90"
+			reqMutex.Lock()
+			req.Send(zmq4.NewMsgString(cmd))
+			req.Recv()
+			reqMutex.Unlock()
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+
+	// Video Stream MJPEG proxy
+	http.HandleFunc("/video", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		piIP := *piIP
+		resp, err := http.Get(fmt.Sprintf("http://%s:5000", piIP)) // Assuming mjpeg-streamer or similar is running on port 5000 on Pi
+		if err != nil {
+			http.Error(w, "Failed to connect to video stream", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+
+		// Flush headers so browser can start reading stream
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Proxy stream
+		buf := make([]byte, 4096)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+	}))
+
+	http.HandleFunc("/telemetry", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		clientChan := make(chan string, 10)
+		telemetryClientsMutex.Lock()
+		telemetryClients[clientChan] = true
+		telemetryClientsMutex.Unlock()
+
+		defer func() {
+			telemetryClientsMutex.Lock()
+			delete(telemetryClients, clientChan)
+			telemetryClientsMutex.Unlock()
+			close(clientChan)
+		}()
+
+		notify := r.Context().Done()
+		for {
+			select {
+			case <-notify:
+				return
+			case msg := <-clientChan:
+				fmt.Fprintf(w, "data: %s\n\n", msg)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}
+	}))
+
+	go func() {
+		log.Println("Starting HTTP server on :8081 for Dashboard")
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
 	panAngle := 90.0
 	tiltAngle := 90.0
 	currentOrientation := Orientation{} // NEW: Store inner ear data
@@ -210,10 +362,6 @@ func main() {
 			}
 		}
 	}()
-
-	var reqMutex sync.Mutex
-	var overrideMutex sync.RWMutex
-	isOverriding := false
 
 	// --- NEW: Goroutine to listen for manual commands from Stdin ---
 	go func() {
@@ -441,6 +589,22 @@ func main() {
 				tiltAngle = newTilt
 			}
 			stateMutex.Unlock()
+		}
+
+		// Broadcast telemetry
+		telemetryData := map[string]interface{}{
+			"pan":      newPan,
+			"tilt":     newTilt,
+			"target_x": payload.TargetX,
+			"target_y": payload.TargetY,
+			"cx":       payload.CX,
+			"cy":       payload.CY,
+			"error_x":  errorX,
+			"error_y":  errorY,
+			"target_id": payload.TargetID,
+		}
+		if b, err := json.Marshal(telemetryData); err == nil {
+			broadcastTelemetry(string(b))
 		}
 	}
 }
