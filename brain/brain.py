@@ -51,7 +51,9 @@ def generate_and_speak(prompt):
     print(f"\n[BRAIN] Generating thought for: '{prompt}'")
     
     sys_instruct = (
-        "You are a robotic arm equipped with a camera. You have just looked at a human. "
+        "You are a robotic arm equipped with a camera and microphone. "
+        "You may receive visual events (seeing a human) or audio events (hearing a human speak). "
+        "Respond appropriately based on the system log provided. "
         "Keep your response strictly under 2 sentences. Be friendly, slightly robotic, "
         "and do not use any markdown formatting or lists."
     )
@@ -99,17 +101,32 @@ def main():
     while True:
         try:
             # Wait for a trigger from the Go bridge
-            visual_event = vision_socket.recv_string()
-            print(f"\n[VISUAL CORTEX DETECTED]: {visual_event}")
+            event = vision_socket.recv_string()
+            print(f"\n[EVENT DETECTED]: {event}")
             
             current_time = time.time()
-            if current_time - last_spoken_time > cooldown_seconds:
-                # Tell Gemini what the Go script saw
-                prompt = f"System log: {visual_event}. Acknowledge them."
+            
+            if event.startswith("[VISUAL]"):
+                if current_time - last_spoken_time > cooldown_seconds:
+                    # Tell Gemini what the Go script saw
+                    prompt = f"System log: {event}. Acknowledge them."
+                    generate_and_speak(prompt)
+                    last_spoken_time = current_time
+                else:
+                    print(f"[BRAIN] Ignoring VISUAL event (Speech Cooldown Active. Wait {int(cooldown_seconds - (current_time - last_spoken_time))}s)")
+                    
+            elif event.startswith("[AUDIO]"):
+                # Audio commands bypass the visual cooldown so the robot can answer immediately
+                prompt = f"System log: {event}. Respond to the user's statement naturally and concisely."
                 generate_and_speak(prompt)
                 last_spoken_time = current_time
+                
             else:
-                print(f"[BRAIN] Ignoring event (Speech Cooldown Active. Wait {int(cooldown_seconds - (current_time - last_spoken_time))}s)")
+                # Fallback for old messages without prefixes
+                if current_time - last_spoken_time > cooldown_seconds:
+                    prompt = f"System log: {event}. Acknowledge them."
+                    generate_and_speak(prompt)
+                    last_spoken_time = current_time
                 
         except KeyboardInterrupt:
             print("\nShutting down brain...")

@@ -94,6 +94,7 @@ type Bridge struct {
 	req      zmq4.Socket
 	sub      zmq4.Socket
 	earSub   zmq4.Socket
+	audioSub zmq4.Socket
 	brainPub zmq4.Socket
 
 	// State Mutexes
@@ -108,6 +109,12 @@ type Bridge struct {
 
 	overrideMutex sync.RWMutex
 	isOverriding  bool
+
+	// Target tracking
+	lastTargetID     int
+	targetChangeTime time.Time
+	thoughtSent      bool
+	lastGreetingTime time.Time
 }
 
 func NewBridge(cfg BridgeConfig) *Bridge {
@@ -156,6 +163,19 @@ func (b *Bridge) Initialize() error {
 		log.Printf("[VISUAL CORTEX] Connected to Frontal Lobe on port 5563")
 	}
 
+	// Setup ZMQ SUB socket for the Auditory Cortex (ear.py)
+	b.audioSub = zmq4.NewSub(context.Background())
+	audioURL := "tcp://0.0.0.0:5558"
+	if err := b.audioSub.Listen(audioURL); err != nil {
+		log.Printf("Warning: Failed to listen for Auditory Cortex at %s: %v", audioURL, err)
+	} else {
+		if err := b.audioSub.SetOption(zmq4.OptionSubscribe, ""); err != nil {
+			log.Printf("Warning: Failed to subscribe to audio: %v", err)
+		} else {
+			log.Printf("[AUDITORY CORTEX] Listening on port 5558")
+		}
+	}
+
 	return nil
 }
 
@@ -169,6 +189,9 @@ func (b *Bridge) Close() {
 	if b.earSub != nil {
 		b.earSub.Close()
 	}
+	if b.audioSub != nil {
+		b.audioSub.Close()
+	}
 	if b.brainPub != nil {
 		b.brainPub.Close()
 	}
@@ -177,6 +200,7 @@ func (b *Bridge) Close() {
 func (b *Bridge) Run() {
 	go b.syncServoStateLoop()
 	go b.syncInnerEarStateLoop()
+	go b.syncAudioLoop()
 	go b.listenManualCommandsLoop()
 
 	b.commandRestPoseAndInit()
@@ -239,6 +263,23 @@ func (b *Bridge) syncInnerEarStateLoop() {
 	}
 }
 
+func (b *Bridge) syncAudioLoop() {
+	for {
+		msg, err := b.audioSub.Recv()
+		if err != nil {
+			continue
+		}
+		if len(msg.Frames) > 0 {
+			text := string(msg.Frames[0])
+			log.Printf("[EAR] Received: %s", text)
+			// Forward to brain with [AUDIO] prefix
+			if err := b.brainPub.Send(zmq4.NewMsgString("[AUDIO] " + text)); err != nil {
+				log.Printf("[ZMQ ERROR] Failed to forward audio to brain: %v", err)
+			}
+		}
+	}
+}
+
 func (b *Bridge) setOverride(status bool) {
 	b.overrideMutex.Lock()
 	b.isOverriding = status
@@ -289,29 +330,44 @@ func (b *Bridge) commandRestPoseAndInit() {
 	}
 }
 
-func (b *Bridge) handleTargetSwitch(payload *Payload, lastTargetID *int) {
-	if payload.TargetID != *lastTargetID {
-		var thought string
-		switch payload.TargetID {
-		case 0:
+func (b *Bridge) handleTargetSwitch(payload *Payload, now time.Time) {
+	if payload.TargetID != b.lastTargetID {
+		if payload.TargetID == 0 {
 			log.Printf("[TARGET] Lost target. Returning to center.")
-		case -1:
-			log.Printf("[TARGET] Locked onto FACE.")
-			thought = "I have locked my camera onto a human face."
-		default:
-			log.Printf("[TARGET] Locked onto Person ID: %d", payload.TargetID)
-			thought = fmt.Sprintf("I have locked my camera onto person number %d.", payload.TargetID)
+		} else {
+			log.Printf("[TARGET] Target acquired: %d. Initiating lock...", payload.TargetID)
 		}
+		
+		b.lastTargetID = payload.TargetID
+		b.targetChangeTime = now
+		b.thoughtSent = false
+	}
 
-		if thought != "" {
-			if err := b.brainPub.Send(zmq4.NewMsgString(thought)); err != nil {
-				log.Printf("[ZMQ ERROR] Failed to send thought to brain: %v", err)
-			} else {
-				log.Printf("[VISUAL CORTEX -> BRAIN]: Triggered thought.")
+	if !b.thoughtSent && b.lastTargetID != 0 {
+		// Remove the 5-second wait, but add a 15-second global cooldown to prevent spam
+		// when foveated vision rapidly loses and regains the target.
+		if now.Sub(b.lastGreetingTime) > 15*time.Second {
+			b.thoughtSent = true
+			b.lastGreetingTime = now
+
+			var thought string
+			switch b.lastTargetID {
+			case -1:
+				log.Printf("[TARGET] Confirmed instant lock onto FACE.")
+				thought = "[VISUAL] I have locked my camera onto a human face."
+			default:
+				log.Printf("[TARGET] Confirmed instant lock onto Person ID: %d", b.lastTargetID)
+				thought = fmt.Sprintf("[VISUAL] I have locked my camera onto person number %d.", b.lastTargetID)
+			}
+
+			if thought != "" {
+				if err := b.brainPub.Send(zmq4.NewMsgString(thought)); err != nil {
+					log.Printf("[ZMQ ERROR] Failed to send thought to brain: %v", err)
+				} else {
+					log.Printf("[VISUAL CORTEX -> BRAIN]: Triggered thought.")
+				}
 			}
 		}
-
-		*lastTargetID = payload.TargetID
 	}
 }
 
@@ -349,7 +405,6 @@ func (b *Bridge) startUDPServer() {
 
 	var lastMoveTime time.Time
 	cooldownDur := time.Duration(b.config.CooldownMs) * time.Millisecond
-	lastTargetID := 0
 	buf := make([]byte, 2048)
 
 	log.Printf("Bridge is fully initialized and waiting for UDP coordinates...")
@@ -367,7 +422,8 @@ func (b *Bridge) startUDPServer() {
 			continue
 		}
 
-		b.handleTargetSwitch(&payload, &lastTargetID)
+		now := time.Now()
+		b.handleTargetSwitch(&payload, now)
 
 		b.overrideMutex.RLock()
 		override := b.isOverriding
@@ -377,7 +433,6 @@ func (b *Bridge) startUDPServer() {
 			continue
 		}
 
-		now := time.Now()
 		if now.Sub(lastMoveTime) < cooldownDur {
 			continue
 		}
