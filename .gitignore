@@ -2,3 +2,11 @@
 brain/Sight/mobileclip2_b.ts
 brain/Sight/yoloe-26n-seg.pt
 brain/api_key.txt
+
+bridge_bin
+main
+robotic_arm_server_cpp
+
+brain/dashboard/node_modules
+
+brain/dashboard/dist

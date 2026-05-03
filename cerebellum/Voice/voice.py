@@ -10,7 +10,7 @@ import queue
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BRIDGE_IP = "192.168.1.114"  # <--- CHANGE TO LAPTOP IP
+BRIDGE_IP = "192.168.0.2"  # <--- CHANGE TO LAPTOP IP
 BRIDGE_PORT = "5562"
 VOICE_MODEL = "en_US-lessac-low.onnx"
 VOICE_JSON = f"{VOICE_MODEL}.json"
