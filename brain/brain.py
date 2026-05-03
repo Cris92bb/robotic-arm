@@ -51,7 +51,8 @@ def generate_and_speak(prompt):
     print(f"\n[BRAIN] Generating thought for: '{prompt}'")
     
     sys_instruct = (
-        "You are a robotic arm equipped with a camera. You have just looked at a human. "
+        "You are a robotic arm equipped with a camera and a microphone. "
+        "You will receive either system logs of what you see, or direct quotes of what a user says to you. "
         "Keep your response strictly under 2 sentences. Be friendly, slightly robotic, "
         "and do not use any markdown formatting or lists."
     )
@@ -98,18 +99,27 @@ def main():
     
     while True:
         try:
-            # Wait for a trigger from the Go bridge
-            visual_event = vision_socket.recv_string()
-            print(f"\n[VISUAL CORTEX DETECTED]: {visual_event}")
+            # Wait for a trigger from the Go bridge or ear
+            event = vision_socket.recv_string()
             
             current_time = time.time()
-            if current_time - last_spoken_time > cooldown_seconds:
-                # Tell Gemini what the Go script saw
-                prompt = f"System log: {visual_event}. Acknowledge them."
+
+            if event.startswith("[AUDIO] User said:"):
+                # This is a direct command! Bypass the 15s cooldown.
+                print(f"\n[AUDIO CORTEX DETECTED]: {event}")
+                prompt = f"User said: {event.replace('[AUDIO] User said:', '').strip()}. Respond to them directly."
                 generate_and_speak(prompt)
                 last_spoken_time = current_time
             else:
-                print(f"[BRAIN] Ignoring event (Speech Cooldown Active. Wait {int(cooldown_seconds - (current_time - last_spoken_time))}s)")
+                # This is a passive vision event. Use the 15s cooldown.
+                print(f"\n[VISUAL CORTEX DETECTED]: {event}")
+                if current_time - last_spoken_time > cooldown_seconds:
+                    # Tell Gemini what the Go script saw
+                    prompt = f"System log: {event}. Acknowledge them."
+                    generate_and_speak(prompt)
+                    last_spoken_time = current_time
+                else:
+                    print(f"[BRAIN] Ignoring event (Speech Cooldown Active. Wait {int(cooldown_seconds - (current_time - last_spoken_time))}s)")
                 
         except KeyboardInterrupt:
             print("\nShutting down brain...")
